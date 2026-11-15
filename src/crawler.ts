@@ -348,10 +348,9 @@ export default class Crawler extends EventEmitter {
           referer: referer || '',
         };
 
-        this.configuration.callbacks.failure(page);
-        this.emit('error', page);
-        this.state.rememberCrawledUrl(url);
-
+        // Write the durable session record before user callbacks: an
+        // 'error' emit without listeners throws, and the failed page
+        // must still be recorded.
         this.session?.completePage({
           requestedUrl: url,
           finalUrl: url,
@@ -363,6 +362,10 @@ export default class Crawler extends EventEmitter {
           isText: false,
           error: error.message,
         });
+
+        this.configuration.callbacks.failure(page);
+        this.emit('error', page);
+        this.state.rememberCrawledUrl(url);
       } finally {
         this.state.finishedCrawling(url);
       }
