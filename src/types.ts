@@ -32,6 +32,13 @@ export interface CrawlerOptions {
   headers?: Record<string, string>;
   respectRobotsTxt?: boolean;
   debug?: boolean;
+  /**
+   * Directory for a persistent crawl session. When set, crawl progress
+   * (progress.json) and page records (records.jsonl) are written there,
+   * and a later crawl with the same directory resumes where it left off.
+   * When omitted, nothing is persisted and behavior is unchanged.
+   */
+  sessionDir?: string;
 }
 
 export interface CrawlCallbackOptions {

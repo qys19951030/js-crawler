@@ -42,6 +42,7 @@ export const DEFAULT_OPTIONS: ConfigurationOptions = {
   headers: {},
   respectRobotsTxt: false,
   debug: false,
+  sessionDir: undefined,
   success: noop,
   failure: noop,
   finished: noop,
@@ -63,6 +64,7 @@ const CRAWL_OPTION_KEYS: (keyof CrawlerOptions)[] = [
   'headers',
   'respectRobotsTxt',
   'debug',
+  'sessionDir',
 ];
 
 export default class Configuration {
