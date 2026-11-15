@@ -13,6 +13,7 @@ import Configuration, {
 } from './configuration.js';
 import State from './state.js';
 import Executor from './executor.js';
+import Session from './session.js';
 import { makeRequest } from './request.js';
 import {
   isHtmlContent,
@@ -27,6 +28,7 @@ export default class Crawler extends EventEmitter {
   private state: State;
   private executor: Executor | null = null;
   private robotsCache: RobotsCache | null = null;
+  private session: Session | null = null;
   private abortController: AbortController | null = null;
   private crawlPromiseResolve: ((urls: string[]) => void) | null = null;
   private pageCount = 0;
@@ -68,9 +70,24 @@ export default class Crawler extends EventEmitter {
       onFinished,
     );
 
-    this.pageCount = 0;
     this.finished = false;
     this.abortController = new AbortController();
+
+    // Set up the persistent session before reading the crawl options:
+    // on resume, options persisted in the session directory win over
+    // newly configured ones, and the page count continues accumulating.
+    this.session = null;
+    const configuredOptions = this.configuration.options;
+    if (configuredOptions.sessionDir) {
+      this.session = new Session(configuredOptions.sessionDir);
+      const resumed = this.session.load();
+      if (resumed) {
+        this.configuration.mergeOptions(this.session.persistedOptions ?? {});
+      } else {
+        this.session.startFresh(configuredOptions);
+      }
+    }
+    this.pageCount = this.session ? this.session.pageCount : 0;
 
     const options = this.configuration.options;
 
@@ -95,14 +112,24 @@ export default class Crawler extends EventEmitter {
       onFinished !== undefined;
 
     if (hasCallbacks) {
-      this.crawlUrl(url, '', options.depth!);
+      this.startCrawling(url, options.depth!);
       return this;
     }
 
     return new Promise<string[]>((resolve) => {
       this.crawlPromiseResolve = resolve;
-      this.crawlUrl(url, '', options.depth!);
+      this.startCrawling(url, options.depth!);
     });
+  }
+
+  private startCrawling(url: string, depth: number): void {
+    // Resumed queue items go first so their persisted depth/referer win.
+    if (this.session) {
+      for (const item of this.session.pendingQueue()) {
+        this.crawlUrl(item.url, item.referer, item.depth);
+      }
+    }
+    this.crawlUrl(url, '', depth);
   }
 
   stop(): void {
@@ -147,6 +174,7 @@ export default class Crawler extends EventEmitter {
     if (this.finished) return;
     this.finished = true;
     this.debug(`Crawling finished, ${crawledUrls.length} URLs crawled`);
+    this.session?.finish();
     this.configuration.callbacks.finished(crawledUrls);
     this.emit('finished', crawledUrls);
     if (this.crawlPromiseResolve) {
@@ -183,11 +211,24 @@ export default class Crawler extends EventEmitter {
       return;
     }
 
+    // With a session, claim the URL so it is never fetched twice —
+    // fragment and hostname-case variants count as the same URL.
+    if (this.session && !this.session.enqueue(url, depth, referer)) {
+      this.checkFinished();
+      return;
+    }
+
     this.state.startedCrawling(url);
     this.debug(`Queuing: ${url} (depth=${depth}, referer=${referer})`);
 
     this.executor!.submit(async () => {
-      if (this.isAborted() || this.state.isVisitedUrl(url)) {
+      if (this.isAborted()) {
+        // Keep the URL queued in the session so a resume picks it up.
+        this.state.finishedCrawling(url);
+        return;
+      }
+      if (this.state.isVisitedUrl(url)) {
+        this.session?.discard(url);
         this.state.finishedCrawling(url);
         return;
       }
@@ -197,6 +238,7 @@ export default class Crawler extends EventEmitter {
         const allowed = await this.robotsCache.isAllowed(url);
         if (!allowed) {
           this.debug(`Blocked by robots.txt: ${url}`);
+          this.session?.discard(url);
           this.state.finishedCrawling(url);
           return;
         }
@@ -245,6 +287,18 @@ export default class Crawler extends EventEmitter {
         this.configuration.callbacks.success(page);
         this.emit('page', page);
         this.state.rememberCrawledUrl(finalUrl);
+
+        this.session?.completePage({
+          requestedUrl: url,
+          finalUrl,
+          visitedUrls: allVisitedUrls,
+          status: response.statusCode,
+          depth,
+          referer: referer || '',
+          body,
+          isText: isTextContent(response),
+          error: null,
+        });
 
         this.debug(`Crawled: ${finalUrl} (status=${response.statusCode})`);
 
@@ -297,6 +351,18 @@ export default class Crawler extends EventEmitter {
         this.configuration.callbacks.failure(page);
         this.emit('error', page);
         this.state.rememberCrawledUrl(url);
+
+        this.session?.completePage({
+          requestedUrl: url,
+          finalUrl: url,
+          visitedUrls: [url],
+          status: null,
+          depth,
+          referer: referer || '',
+          body: '',
+          isText: false,
+          error: error.message,
+        });
       } finally {
         this.state.finishedCrawling(url);
       }

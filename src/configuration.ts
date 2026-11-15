@@ -79,6 +79,17 @@ export default class Configuration {
     this.config.depth = Math.max(this.config.depth!, 0);
   }
 
+  /**
+   * Merges options over the current configuration without resetting
+   * callbacks. Used to apply session-persisted crawl options on resume.
+   */
+  mergeOptions(options: Partial<CrawlerOptions>): void {
+    this.config = { ...this.config, ...options };
+    if (this.config.depth !== undefined) {
+      this.config.depth = Math.max(this.config.depth, 0);
+    }
+  }
+
   get options(): CrawlerOptions {
     const result: Record<string, unknown> = {};
     for (const key of CRAWL_OPTION_KEYS) {

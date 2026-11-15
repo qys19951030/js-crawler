@@ -17,8 +17,48 @@
  * recorded pages are treated as already visited (never re-fetched), and
  * queued URLs continue with the depth/referer they were first seen with.
  */
+import {
+  existsSync,
+  mkdirSync,
+  readFileSync,
+  renameSync,
+  writeFileSync,
+} from 'node:fs';
+import { join } from 'node:path';
 import type { CrawlerOptions } from './types.js';
-import type { QueueItem } from './frontier.js';
+import Frontier, {
+  FRONTIER_VERSION,
+  type FrontierSnapshot,
+  type QueueItem,
+} from './frontier.js';
+import RecordsWriter, {
+  contentFingerprint,
+  type PageRecord,
+} from './records.js';
+
+const PROGRESS_FILE = 'progress.json';
+const RECORDS_FILE = 'records.jsonl';
+
+/**
+ * Crawl options persisted with the session and restored on resume.
+ * Only serializable scalars — function options (shouldCrawl etc.) cannot
+ * be persisted and are taken from the current configuration on resume.
+ */
+const PERSISTED_OPTION_KEYS: (keyof CrawlerOptions)[] = [
+  'depth',
+  'ignoreRelative',
+  'userAgent',
+  'maxRequestsPerSecond',
+  'maxConcurrentRequests',
+  'requestTimeout',
+  'maxRetries',
+  'retryDelay',
+  'maxPages',
+  'selector',
+  'headers',
+  'respectRobotsTxt',
+  'debug',
+];
 
 /** Everything needed to persist one fetched page. */
 export interface PageOutcome {
@@ -43,52 +83,108 @@ export interface PageOutcome {
 }
 
 export default class Session {
-  constructor(_dir: string) {
-    throw new Error('not implemented');
+  private readonly dir: string;
+  private readonly records: RecordsWriter;
+  private frontier: Frontier = new Frontier();
+  private resumed = false;
+
+  constructor(dir: string) {
+    this.dir = dir;
+    this.records = new RecordsWriter(join(dir, RECORDS_FILE));
   }
 
   /**
    * Loads existing session state, if any. Returns true when resuming.
    * Reconciles the frontier with records.jsonl so pages whose records
-   * reached disk are never fetched again.
+   * reached disk are never fetched again, even if the process died
+   * between writing a record and saving the frontier.
    */
   load(): boolean {
-    throw new Error('not implemented');
+    mkdirSync(this.dir, { recursive: true });
+
+    let found = false;
+    const progressPath = join(this.dir, PROGRESS_FILE);
+    if (existsSync(progressPath)) {
+      const snapshot = JSON.parse(
+        readFileSync(progressPath, 'utf8'),
+      ) as FrontierSnapshot;
+      this.frontier = new Frontier(snapshot);
+      found = true;
+    }
+
+    const records = this.records.readAll();
+    if (records.length > 0) {
+      found = true;
+      let successCount = 0;
+      for (const record of records) {
+        this.frontier.dequeue(record.url);
+        this.frontier.markCrawled(record.url);
+        if (record.error === null) successCount++;
+      }
+      // The page count is at least the number of successful records on
+      // disk, even if progress.json was lost or is stale.
+      if (successCount > this.frontier.pageCount) {
+        this.frontier.pageCount = successCount;
+      }
+    }
+
+    this.resumed = found;
+    return found;
   }
 
   /** Options persisted with the session (null on a fresh session). */
   get persistedOptions(): Partial<CrawlerOptions> | null {
-    throw new Error('not implemented');
+    return this.resumed ? this.frontier.persistedOptions : null;
   }
 
   /** Global crawled-page count, accumulated across processes. */
   get pageCount(): number {
-    throw new Error('not implemented');
+    return this.frontier.pageCount;
   }
 
   /** Starts a fresh session with the given crawl options. */
-  startFresh(_options: Partial<CrawlerOptions>): void {
-    throw new Error('not implemented');
+  startFresh(options: CrawlerOptions): void {
+    const persisted: Record<string, unknown> = {};
+    for (const key of PERSISTED_OPTION_KEYS) {
+      if (options[key] !== undefined) {
+        persisted[key] = options[key];
+      }
+    }
+    this.frontier.persistedOptions = persisted as Partial<CrawlerOptions>;
+    this.save();
   }
 
-  /** True if the URL is already visited or queued (never fetch twice). */
-  isKnown(_url: string): boolean {
-    throw new Error('not implemented');
+  /**
+   * Claims a URL for crawling: adds it to the pending queue and persists
+   * the frontier. Returns false when the URL is already known (visited
+   * or queued) and must not be fetched again.
+   */
+  enqueue(url: string, depth: number, referer: string): boolean {
+    if (!this.frontier.enqueue(url, depth, referer)) {
+      return false;
+    }
+    this.save();
+    return true;
   }
 
-  /** Queues a URL discovered during this run and persists the frontier. */
-  enqueue(_url: string, _depth: number, _referer: string): void {
-    throw new Error('not implemented');
-  }
-
-  /** Queued URLs to continue with on resume. */
+  /**
+   * Queued URLs to continue with on resume. Drains the in-memory queue:
+   * the crawler is expected to re-claim the items it will actually crawl
+   * via enqueue(); anything it rejects (depth, shouldCrawl, maxPages)
+   * stays out of the frontier.
+   */
   pendingQueue(): QueueItem[] {
-    throw new Error('not implemented');
+    const items = this.frontier.pending();
+    for (const item of items) {
+      this.frontier.dequeue(item.url);
+    }
+    return items;
   }
 
   /** Removes a URL from the queue without recording a page (e.g. robots.txt block). */
-  discard(_url: string): void {
-    throw new Error('not implemented');
+  discard(url: string): void {
+    this.frontier.dequeue(url);
+    this.save();
   }
 
   /**
@@ -97,12 +193,43 @@ export default class Session {
    * reconciliation guarantees a page that reached disk is never
    * re-fetched, even if the process dies between the two writes.
    */
-  completePage(_outcome: PageOutcome): void {
-    throw new Error('not implemented');
+  completePage(outcome: PageOutcome): void {
+    const record: PageRecord = {
+      url: outcome.finalUrl,
+      status: outcome.status,
+      depth: outcome.depth,
+      referer: outcome.referer,
+      fetchedAt: new Date().toISOString(),
+      contentFingerprint:
+        outcome.error === null
+          ? contentFingerprint(outcome.body, outcome.isText)
+          : null,
+      error: outcome.error,
+    };
+    this.records.append(record);
+
+    this.frontier.dequeue(outcome.requestedUrl);
+    this.frontier.markVisited(outcome.visitedUrls);
+    this.frontier.markCrawled(outcome.finalUrl);
+    if (outcome.error === null) {
+      this.frontier.pageCount++;
+    }
+    this.save();
   }
 
   /** Persists the final frontier state when a crawl run ends. */
   finish(): void {
-    throw new Error('not implemented');
+    this.save();
+  }
+
+  /** Atomically rewrites progress.json (tmp file + rename). */
+  private save(): void {
+    const snapshot: FrontierSnapshot = {
+      ...this.frontier.toSnapshot(),
+      version: FRONTIER_VERSION,
+    };
+    const tmpPath = join(this.dir, `${PROGRESS_FILE}.tmp`);
+    writeFileSync(tmpPath, JSON.stringify(snapshot, null, 2), 'utf8');
+    renameSync(tmpPath, join(this.dir, PROGRESS_FILE));
   }
 }
