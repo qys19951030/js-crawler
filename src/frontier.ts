@@ -42,59 +42,111 @@ export interface FrontierSnapshot {
   queue: QueueItem[];
 }
 
+export const FRONTIER_VERSION = 1;
+
 /**
  * The crawl frontier: visited/crawled URL sets plus the pending queue.
- * Pure in-memory data structure; persistence lives in SessionStore.
+ * Pure in-memory data structure; persistence lives in Session.
  */
 export default class Frontier {
-  constructor(_snapshot?: FrontierSnapshot) {
-    throw new Error('not implemented');
+  private visitedUrls: Set<string> = new Set();
+  private crawledUrls: Set<string> = new Set();
+  private queue: Map<string, QueueItem> = new Map();
+  private options: Partial<CrawlerOptions> = {};
+  private count = 0;
+
+  constructor(snapshot?: FrontierSnapshot) {
+    if (!snapshot) return;
+    this.options = snapshot.options ?? {};
+    this.count = snapshot.pageCount ?? 0;
+    for (const url of snapshot.visitedUrls ?? []) {
+      this.visitedUrls.add(normalizeUrl(url));
+    }
+    for (const url of snapshot.crawledUrls ?? []) {
+      this.crawledUrls.add(normalizeUrl(url));
+    }
+    for (const item of snapshot.queue ?? []) {
+      const url = normalizeUrl(item.url);
+      this.queue.set(url, { url, depth: item.depth, referer: item.referer });
+    }
   }
 
   get pageCount(): number {
-    throw new Error('not implemented');
+    return this.count;
   }
 
-  set pageCount(_value: number) {
-    throw new Error('not implemented');
+  set pageCount(value: number) {
+    this.count = value;
+  }
+
+  get persistedOptions(): Partial<CrawlerOptions> {
+    return this.options;
+  }
+
+  set persistedOptions(options: Partial<CrawlerOptions>) {
+    this.options = options;
   }
 
   /** True if the URL is already visited or still queued. */
-  isKnown(_url: string): boolean {
-    throw new Error('not implemented');
+  isKnown(url: string): boolean {
+    const normalized = normalizeUrl(url);
+    return this.visitedUrls.has(normalized) || this.queue.has(normalized);
   }
 
-  isVisited(_url: string): boolean {
-    throw new Error('not implemented');
+  isVisited(url: string): boolean {
+    return this.visitedUrls.has(normalizeUrl(url));
   }
 
-  /** Adds a URL to the pending queue (no-op if already known). */
-  enqueue(_url: string, _depth: number, _referer: string): boolean {
-    throw new Error('not implemented');
+  isCrawled(url: string): boolean {
+    return this.crawledUrls.has(normalizeUrl(url));
+  }
+
+  /**
+   * Adds a URL to the pending queue. Returns false (and keeps the
+   * original depth/referer) when the URL is already known.
+   */
+  enqueue(url: string, depth: number, referer: string): boolean {
+    const normalized = normalizeUrl(url);
+    if (this.visitedUrls.has(normalized) || this.queue.has(normalized)) {
+      return false;
+    }
+    this.queue.set(normalized, { url: normalized, depth, referer });
+    return true;
   }
 
   /** Removes a URL from the pending queue. */
-  dequeue(_url: string): void {
-    throw new Error('not implemented');
+  dequeue(url: string): void {
+    this.queue.delete(normalizeUrl(url));
   }
 
   /** Marks URLs as visited (final URL plus any redirect chain URLs). */
-  markVisited(_urls: string[]): void {
-    throw new Error('not implemented');
+  markVisited(urls: string[]): void {
+    for (const url of urls) {
+      this.visitedUrls.add(normalizeUrl(url));
+    }
   }
 
-  /** Marks a URL as successfully crawled (or terminally failed). */
-  markCrawled(_url: string): void {
-    throw new Error('not implemented');
+  /** Marks a URL as crawled (successfully or terminally failed). */
+  markCrawled(url: string): void {
+    const normalized = normalizeUrl(url);
+    this.visitedUrls.add(normalized);
+    this.crawledUrls.add(normalized);
   }
 
   /** All queued items waiting to be crawled. */
   pending(): QueueItem[] {
-    throw new Error('not implemented');
+    return [...this.queue.values()];
   }
 
   /** Serializes the frontier for persistence. */
   toSnapshot(): FrontierSnapshot {
-    throw new Error('not implemented');
+    return {
+      version: FRONTIER_VERSION,
+      options: this.options,
+      pageCount: this.count,
+      visitedUrls: [...this.visitedUrls],
+      crawledUrls: [...this.crawledUrls],
+      queue: this.pending(),
+    };
   }
 }
